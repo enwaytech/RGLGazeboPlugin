@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(RGLGazeboPlugin)
+project(rgl_gazebo_plugin)
 
 find_package(ament_cmake REQUIRED)
 
