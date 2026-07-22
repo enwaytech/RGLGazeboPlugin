@@ -9,18 +9,19 @@ project(RGLVisualize)
 
 set(CMAKE_AUTOMOC ON)
 
-find_package(gz-cmake3 REQUIRED)
-gz_find_package(gz-msgs10 REQUIRED)
-set(GZ_MSGS_VER ${gz-msgs10_VERSION_MAJOR})
+# ROS 2 Lyrical / Ubuntu resolute: versionless gz-*-vendor packages
+# (gz-msgs, gz-rendering, gz-gui are Ionic-era and Qt6-based).
+find_package(gz_cmake_vendor REQUIRED)
+find_package(gz-cmake REQUIRED)
+find_package(gz_msgs_vendor REQUIRED)
+gz_find_package(gz-msgs REQUIRED)
+find_package(gz_rendering_vendor REQUIRED)
+gz_find_package(gz-rendering REQUIRED)
+find_package(gz_gui_vendor REQUIRED)
+gz_find_package(gz-gui REQUIRED)
+find_package(Qt6 REQUIRED COMPONENTS Core Widgets)
 
-gz_find_package(gz-rendering8 REQUIRED)
-set(GZ_RENDERING_VER ${gz-rendering8_VERSION_MAJOR})
-
-
-gz_find_package(gz-gui8 REQUIRED)
-set(GZ_GUI_VER ${gz-gui8_VERSION_MAJOR})
-
-QT5_ADD_RESOURCES(resources_RCC RGLVisualize.qrc)
+qt6_add_resources(resources_RCC RGLVisualize.qrc)
 
 add_library(RGLVisualize SHARED
     RGLVisualize.cc
@@ -29,9 +30,9 @@ add_library(RGLVisualize SHARED
 
 target_link_libraries(RGLVisualize
     PRIVATE
-    gz-msgs${GZ_MSGS_VER}::gz-msgs${GZ_MSGS_VER}
-    gz-rendering${GZ_RENDERING_VER}::gz-rendering${GZ_RENDERING_VER}
-    gz-gui${GZ_GUI_VER}::gz-gui${GZ_GUI_VER}
+    gz-msgs::core
+    gz-rendering::core
+    gz-gui::core
 )
 
 ## Install libraries
