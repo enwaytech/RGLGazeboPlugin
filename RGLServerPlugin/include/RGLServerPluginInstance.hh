@@ -62,6 +62,7 @@ public:
 
 private:
     bool LoadConfiguration(const std::shared_ptr<const sdf::Element>& sdf);
+    bool LoadNoiseConfiguration(const std::shared_ptr<const sdf::Element>& sdf);
     void CreateLidar(gz::sim::Entity entity,
                      gz::sim::EntityComponentManager& ecm);
 
@@ -88,6 +89,18 @@ private:
     int scanHSamples;
     std::vector<rgl_mat3x4f> lidarPattern;
     std::size_t alternatingPatternIndex = 0;
+
+    struct GaussianNoise
+    {
+        bool enabled = false;
+        float mean = 0.0f;
+        float stDev = 0.0f;
+        float stDevRisePerMeter = 0.0f;  // distance noise only
+        rgl_axis_t axis = RGL_AXIS_Z;    // angular noise only
+    };
+    GaussianNoise noiseAngularRay;
+    GaussianNoise noiseAngularHitpoint;
+    GaussianNoise noiseDistance;
 
     struct ResultPointCloud
     {

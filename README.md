@@ -154,6 +154,24 @@ Inside the link entity in your model, add a custom sensor:
 
 - **pattern_\<type\>** - definition of the lidar firing pattern. Each type has different parameters described below.
 
+- **noise** - Gaussian noise added to the measurements (optional, see [RGL docs](https://github.com/RobotecAI/RobotecGPULidar/blob/main/docs/GaussianNoise.md)). Each child is optional; inside a child `stddev` is required, `mean` and `stddev_rise_per_meter` default to 0 and `axis` defaults to `z`. A child with all values zero is skipped.
+  ```xml
+  <noise>
+    <distance>                    <!-- meters, along the ray -->
+      <mean>0.0</mean>
+      <stddev>0.01</stddev>
+      <stddev_rise_per_meter>0.0</stddev_rise_per_meter>  <!-- distance only -->
+    </distance>
+    <angular_hitpoint>            <!-- radians, rotates hit points around the lidar origin -->
+      <stddev>0.001</stddev>
+      <axis>z</axis>              <!-- angular only: x, y or z in lidar frame -->
+    </angular_hitpoint>
+    <angular_ray>                 <!-- radians, rotates rays before raytracing; same parameters as angular_hitpoint -->
+      <stddev>0.001</stddev>
+    </angular_ray>
+  </noise>
+  ```
+
 ### Pattern types:
 
 - **pattern_uniform**\
