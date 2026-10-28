@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cmath>
 #include <cstdio>
+#include <limits>
+#include <map>
+#include <sstream>
 
 #include "RGLServerPluginInstance.hh"
 #include "Utils.hh"
@@ -24,6 +28,14 @@
 #define PARAM_TOPIC_ID "topic"
 #define PARAM_FRAME_ID "frame"
 #define PARAM_UPDATE_ON_PAUSED_SIM_ID "update_on_paused_sim"
+#define PARAM_NOISE_ID "noise"
+#define PARAM_NOISE_ANGULAR_RAY_ID "angular_ray"
+#define PARAM_NOISE_ANGULAR_HITPOINT_ID "angular_hitpoint"
+#define PARAM_NOISE_DISTANCE_ID "distance"
+#define PARAM_NOISE_MEAN_ID "mean"
+#define PARAM_NOISE_STDDEV_ID "stddev"
+#define PARAM_NOISE_STDDEV_RISE_PER_METER_ID "stddev_rise_per_meter"
+#define PARAM_NOISE_AXIS_ID "axis"
 
 namespace rgl
 {
@@ -73,6 +85,10 @@ bool RGLServerPluginInstance::LoadConfiguration(const std::shared_ptr<const sdf:
     topicName = sdf->Get<std::string>(PARAM_TOPIC_ID);
     frameId = sdf->Get<std::string>(PARAM_FRAME_ID);
 
+    if (!LoadNoiseConfiguration(sdf)) {
+        return false;
+    }
+
     if (!LidarPatternLoader::Load(sdf, lidarPattern, lidarPatternSampleSize)) {
         return false;
     }
@@ -92,6 +108,74 @@ bool RGLServerPluginInstance::LoadConfiguration(const std::shared_ptr<const sdf:
     }
 
     return true;
+}
+
+bool RGLServerPluginInstance::LoadNoiseConfiguration(const std::shared_ptr<const sdf::Element>& sdf)
+{
+    if (!sdf->HasElement(PARAM_NOISE_ID)) {
+        return true;
+    }
+    const auto noiseSdf = sdf->FindElement(PARAM_NOISE_ID);
+
+    for (auto child = noiseSdf->GetFirstElement(); child != nullptr; child = child->GetNextElement()) {
+        const std::string name = child->GetName();
+        if (name != PARAM_NOISE_ANGULAR_RAY_ID && name != PARAM_NOISE_ANGULAR_HITPOINT_ID && name != PARAM_NOISE_DISTANCE_ID) {
+            gzwarn << "Unknown '" << PARAM_NOISE_ID << "' child element '" << name << "' for the RGL lidar. Ignoring it.\n";
+        }
+    }
+
+    auto loadNoise = [&](const char* noiseTypeId, bool isAngular, GaussianNoise& outNoise) -> bool {
+        if (!noiseSdf->HasElement(noiseTypeId)) {
+            return true;
+        }
+        const auto noiseTypeSdf = noiseSdf->FindElement(noiseTypeId);
+        if (!noiseTypeSdf->HasElement(PARAM_NOISE_STDDEV_ID)) {
+            gzerr << "No '" << PARAM_NOISE_STDDEV_ID << "' parameter specified for the RGL lidar '"
+                  << noiseTypeId << "' noise. Disabling plugin.\n";
+            return false;
+        }
+        const char* ignoredParam = isAngular ? PARAM_NOISE_STDDEV_RISE_PER_METER_ID : PARAM_NOISE_AXIS_ID;
+        if (noiseTypeSdf->HasElement(ignoredParam)) {
+            gzwarn << "Parameter '" << ignoredParam << "' does not apply to the RGL lidar '" << noiseTypeId
+                   << "' noise. Ignoring it.\n";
+        }
+
+        outNoise.stDev = noiseTypeSdf->Get<float>(PARAM_NOISE_STDDEV_ID);
+        outNoise.mean = noiseTypeSdf->Get<float>(PARAM_NOISE_MEAN_ID, outNoise.mean).first;
+        outNoise.stDevRisePerMeter = noiseTypeSdf->Get<float>(PARAM_NOISE_STDDEV_RISE_PER_METER_ID, outNoise.stDevRisePerMeter).first;
+        if (outNoise.stDev < 0.0f || outNoise.stDevRisePerMeter < 0.0f) {
+            gzerr << "Standard deviation of the RGL lidar '" << noiseTypeId << "' noise must not be negative. Disabling plugin.\n";
+            return false;
+        }
+        outNoise.enabled = outNoise.mean != 0.0f || outNoise.stDev != 0.0f || outNoise.stDevRisePerMeter != 0.0f;
+        if (!outNoise.enabled) {
+            gzmsg << "RGL lidar '" << noiseTypeId << "' noise is configured with zero mean and stddev, skipping it.\n";
+            return true;
+        }
+
+        static const std::map<std::string, rgl_axis_t> axes = {{"x", RGL_AXIS_X}, {"y", RGL_AXIS_Y}, {"z", RGL_AXIS_Z}};
+        const std::string axis = noiseTypeSdf->Get<std::string>(PARAM_NOISE_AXIS_ID, "z").first;
+        if (axes.count(axis) == 0) {
+            gzerr << "Invalid '" << PARAM_NOISE_AXIS_ID << "' parameter '" << axis << "' for the RGL lidar '"
+                  << noiseTypeId << "' noise. Expected 'x', 'y' or 'z'. Disabling plugin.\n";
+            return false;
+        }
+        outNoise.axis = axes.at(axis);
+
+        std::ostringstream details;
+        if (isAngular) {
+            details << ", axis: " << axis;
+        } else {
+            details << ", stddev rise per meter: " << outNoise.stDevRisePerMeter;
+        }
+        gzmsg << "RGL lidar '" << noiseTypeId << "' noise enabled (mean: " << outNoise.mean << ", stddev: " << outNoise.stDev
+              << details.str() << ")\n";
+        return true;
+    };
+
+    return loadNoise(PARAM_NOISE_ANGULAR_RAY_ID, true, noiseAngularRay) &&
+           loadNoise(PARAM_NOISE_ANGULAR_HITPOINT_ID, true, noiseAngularHitpoint) &&
+           loadNoise(PARAM_NOISE_DISTANCE_ID, false, noiseDistance);
 }
 
 void RGLServerPluginInstance::CreateLidar(gz::sim::Entity entity,
@@ -138,10 +222,41 @@ void RGLServerPluginInstance::CreateLidar(gz::sim::Entity entity,
         return;
     }
 
+    // Optional Gaussian noise, see https://github.com/RobotecAI/RobotecGPULidar/blob/main/docs/GaussianNoise.md
+    rgl_node_t raysTail = rglNodeLidarPose;   // last node before raytracing
+    rgl_node_t pointsTail = rglNodeRaytrace;  // last node producing hit points
+    if (noiseAngularRay.enabled) {
+        rgl_node_t node = nullptr;
+        if (!CheckRGL(rgl_node_gaussian_noise_angular_ray(&node, noiseAngularRay.mean, noiseAngularRay.stDev, noiseAngularRay.axis)) ||
+            !CheckRGL(rgl_graph_node_add_child(raysTail, node))) {
+            gzerr << "Failed to create RGL nodes when initializing lidar. Disabling plugin.\n";
+            return;
+        }
+        raysTail = node;
+    }
+    if (noiseDistance.enabled) {
+        rgl_node_t node = nullptr;
+        if (!CheckRGL(rgl_node_gaussian_noise_distance(&node, noiseDistance.mean, noiseDistance.stDev, noiseDistance.stDevRisePerMeter)) ||
+            !CheckRGL(rgl_graph_node_add_child(pointsTail, node))) {
+            gzerr << "Failed to create RGL nodes when initializing lidar. Disabling plugin.\n";
+            return;
+        }
+        pointsTail = node;
+    }
+    if (noiseAngularHitpoint.enabled) {
+        rgl_node_t node = nullptr;
+        if (!CheckRGL(rgl_node_gaussian_noise_angular_hitpoint(&node, noiseAngularHitpoint.mean, noiseAngularHitpoint.stDev, noiseAngularHitpoint.axis)) ||
+            !CheckRGL(rgl_graph_node_add_child(pointsTail, node))) {
+            gzerr << "Failed to create RGL nodes when initializing lidar. Disabling plugin.\n";
+            return;
+        }
+        pointsTail = node;
+    }
+
     if (!CheckRGL(rgl_graph_node_add_child(rglNodesUseRays.front(), rglNodeSetRange)) ||
         !CheckRGL(rgl_graph_node_add_child(rglNodeSetRange, rglNodeLidarPose)) ||
-        !CheckRGL(rgl_graph_node_add_child(rglNodeLidarPose, rglNodeRaytrace)) ||
-        !CheckRGL(rgl_graph_node_add_child(rglNodeRaytrace, rglNodeCompact)) ||
+        !CheckRGL(rgl_graph_node_add_child(raysTail, rglNodeRaytrace)) ||
+        !CheckRGL(rgl_graph_node_add_child(pointsTail, rglNodeCompact)) ||
         !CheckRGL(rgl_graph_node_add_child(rglNodeCompact, rglNodeFormatPointCloudWorld))) {
 
         gzerr << "Failed to connect RGL nodes when initializing lidar. Disabling plugin.\n";
@@ -149,7 +264,7 @@ void RGLServerPluginInstance::CreateLidar(gz::sim::Entity entity,
     }
 
     if (publishLaserScan) {
-        if(!CheckRGL(rgl_graph_node_add_child(rglNodeRaytrace, rglNodeYieldLaserScan)) ||
+        if(!CheckRGL(rgl_graph_node_add_child(pointsTail, rglNodeYieldLaserScan)) ||
            // Optimization: rglNodeYieldLaserScan should be prioritized because it will be requested first
            !CheckRGL(rgl_graph_node_set_priority(rglNodeYieldLaserScan, 1))) {
             gzerr << "Failed to connect RGL nodes when initializing lidar. Disabling plugin.\n";
@@ -309,7 +424,8 @@ gz::msgs::LaserScan RGLServerPluginInstance::CreateLaserScanMsg(std::chrono::ste
     outMsg.set_angle_step(hStep.Radian());
 
     for (int i = 0; i < pointCount; ++i) {
-        outMsg.add_ranges(resultLaserScan.distances[i]);
+        // Distance noise turns the infinite range of non-hits into NaN. Report non-hits as infinity again.
+        outMsg.add_ranges(std::isnan(resultLaserScan.distances[i]) ? std::numeric_limits<float>::infinity() : resultLaserScan.distances[i]);
         outMsg.add_intensities(resultLaserScan.intensities[i]);
     }
 
