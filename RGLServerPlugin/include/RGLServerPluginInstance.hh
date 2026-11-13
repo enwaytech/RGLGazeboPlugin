@@ -76,7 +76,13 @@ private:
     bool FetchLaserScanResult();
     bool FetchPointCloudResult(rgl_node_t formatNode);
 
+    bool CreateMirrorGraph();
+    bool FetchExtendedPointCloudResult(rgl_node_t formatNode);
+    bool TraceMirrorReflections();
+    void ApplyMirrorReflections(bool worldFrame);
+
     gz::msgs::PointCloudPacked CreatePointCloudMsg(std::chrono::steady_clock::duration sim_time, const std::string& frame);
+    gz::msgs::PointCloudPacked CreateExtendedPointCloudMsg(std::chrono::steady_clock::duration sim_time, const std::string& frame);
     gz::msgs::LaserScan CreateLaserScanMsg(std::chrono::steady_clock::duration sim_time, const std::string& frame);
 
     void DestroyLidar();
@@ -113,6 +119,78 @@ private:
         };
     } resultPointCloud{};
 
+    // Point cloud with additional per-point fields, used when extended output or mirror reflections are enabled.
+    // The memory layout equals the published message layout with extended output.
+    struct ExtendedPoint
+    {
+        rgl_vec3f xyz;
+        float laserRetro;
+        uint32_t rayIdx;
+        float incidentAngle;
+        uint8_t isReflected;
+        uint8_t padding[3];
+    };
+    static_assert(sizeof(ExtendedPoint) == 28, "ExtendedPoint must match the RGL format of ResultExtendedPointCloud");
+
+    struct ResultExtendedPointCloud
+    {
+        std::vector<ExtendedPoint> points{};
+        int32_t hitPointCount{};
+        // The padding field is overwritten with isReflected and padding
+        inline static const std::vector<rgl_field_t> rglFields = {
+                RGL_FIELD_XYZ_VEC3_F32,
+                RGL_FIELD_LASER_RETRO_F32,
+                RGL_FIELD_RAY_IDX_U32,
+                RGL_FIELD_INCIDENT_ANGLE_F32,
+                RGL_FIELD_PADDING_32
+        };
+    } resultExtendedPointCloud{};
+
+    // Single-bounce reflection on visuals with laser_retro equal to specularLaserRetro.
+    // Buffers are sized to the pattern sample size on creation to avoid allocations at runtime.
+    struct MirrorReflection
+    {
+        std::size_t pointIdx;  // index in resultExtendedPointCloud
+        float distanceScale;   // total path length divided by the distance to the mirror
+        float laserRetro;
+        float incidentAngle;
+    };
+    struct MirrorTrace
+    {
+        // Hit points of the primary raytrace in world frame, same order as resultExtendedPointCloud
+        std::vector<rgl_vec3f> hitPoints{};
+        std::vector<float> distances{};
+        std::vector<rgl_vec3f> normals{};
+        // Reflected rays
+        std::vector<rgl_mat3x4f> rays{};
+        std::vector<rgl_vec2f> ranges{};
+        std::vector<std::size_t> pointIdx{};
+        // Results of the reflected rays
+        std::vector<int32_t> isHit{};
+        std::vector<float> reflectedDistances{};
+        std::vector<float> reflectedLaserRetro{};
+        std::vector<float> reflectedIncidentAngles{};
+        std::vector<MirrorReflection> reflections{};
+        inline static const std::vector<rgl_field_t> rglFieldsPrimary = {
+                RGL_FIELD_XYZ_VEC3_F32,
+                RGL_FIELD_DISTANCE_F32,
+                RGL_FIELD_NORMAL_VEC3_F32
+        };
+        inline static const std::vector<rgl_field_t> rglFieldsReflected = {
+                RGL_FIELD_IS_HIT_I32,
+                RGL_FIELD_DISTANCE_F32,
+                RGL_FIELD_LASER_RETRO_F32,
+                RGL_FIELD_INCIDENT_ANGLE_F32
+        };
+        // Reflected rays start this far from the mirror to avoid hitting it again
+        static constexpr float rayOriginOffset{1e-3f};
+    } mirrorTrace{};
+
+    bool extendedOutput = false;
+    bool specularReflections = false;
+    float specularLaserRetro = 0.0f;
+    rgl_mat3x4f lidarToWorld{};
+
     struct ResultLaserScan
     {
         std::vector<float> distances{};
@@ -142,6 +220,13 @@ private:
     rgl_node_t rglNodeFormatPointCloudSensor = nullptr;
     rgl_node_t rglNodeFormatPointCloudWorld = nullptr;
     rgl_node_t rglNodeToLidarFrame = nullptr;
+    rgl_node_t rglNodeYieldMirror = nullptr;
+
+    // Separate graph tracing the rays reflected by mirrors
+    rgl_node_t rglNodeMirrorRays = nullptr;
+    rgl_node_t rglNodeMirrorSetRange = nullptr;
+    rgl_node_t rglNodeMirrorRaytrace = nullptr;
+    rgl_node_t rglNodeMirrorYield = nullptr;
 
     std::chrono::steady_clock::duration raytraceIntervalTime;
     std::chrono::steady_clock::duration lastRaytraceTime{0};

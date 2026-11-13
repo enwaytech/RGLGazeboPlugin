@@ -172,6 +172,36 @@ Inside the link entity in your model, add a custom sensor:
   </noise>
   ```
 
+- **extended_output** - adds per-point fields to the published point cloud (optional, default: false). The first four fields are unchanged; the `/world` topic uses the same layout. Not supported for `pattern_lidar2d` (ignored with a warning).
+
+  | field | offset | type | meaning |
+  |---|---|---|---|
+  | `x`, `y`, `z` | 0, 4, 8 | FLOAT32 | hit point (meters) |
+  | `intensity` | 12 | FLOAT32 | `laser_retro` of the hit visual |
+  | `ray_index` | 16 | UINT32 | index of the ray in the pattern (`ring * horizontal_samples + column` for `pattern_uniform`; for alternating patterns the index in the whole pattern file) |
+  | `incident_angle` | 20 | FLOAT32 | angle between the ray and the surface normal, radians in [0, pi/2] |
+  | `is_reflected` | 24 | UINT8 | 1 if the point is a mirror reflection (see `specular_laser_retro`), else 0 |
+
+  `point_step` is 28 (3 padding bytes keep the fields 4-byte aligned). With `noise`, `ray_index` and `incident_angle` describe the ray and the surface hit before noise is applied.
+  ```xml
+  <extended_output>true</extended_output>
+  ```
+
+- **specular_laser_retro** - enables single-bounce mirror reflections (optional, default: no reflections). Visuals whose `<laser_retro>` equals this value are mirrors. A ray hitting a mirror is reflected (`d' = d - 2 (d.n) n`) and traced again from the hit point with the remaining range (total path limited to `range/max`):
+  - the reflected ray hits a surface: the point is reported along the original ray at the total path length (where a time-of-flight sensor sees it), with `intensity` = `laser_retro` and `incident_angle` of the reflected surface and `is_reflected` = 1;
+  - the reflected ray hits nothing or another mirror: the point stays on the mirror surface with `intensity` = the specular value and `is_reflected` = 0.
+
+  Can be used without `extended_output` (basic point cloud layout). Cannot be combined with `noise` (the plugin is disabled with an error). Not supported for `pattern_lidar2d` (ignored with a warning). Mark mirrors with a value no regular visual uses, e.g. -1:
+  ```xml
+  <specular_laser_retro>-1.0</specular_laser_retro>
+  <!-- in the mirror model -->
+  <visual name="mirror">
+    <laser_retro>-1</laser_retro>
+    ...
+  </visual>
+  ```
+  See `test_world/rgl_mirror.sdf` for an example.
+
 ### Pattern types:
 
 - **pattern_uniform**\
