@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -20,6 +21,8 @@
 
 #include "RGLServerPluginInstance.hh"
 #include "Utils.hh"
+
+#include <gz/math/Vector3.hh>
 
 #define PARAM_UPDATE_RATE_ID "update_rate"
 #define PARAM_RANGE_ID "range"
@@ -36,6 +39,8 @@
 #define PARAM_NOISE_STDDEV_ID "stddev"
 #define PARAM_NOISE_STDDEV_RISE_PER_METER_ID "stddev_rise_per_meter"
 #define PARAM_NOISE_AXIS_ID "axis"
+#define PARAM_EXTENDED_OUTPUT_ID "extended_output"
+#define PARAM_SPECULAR_LASER_RETRO_ID "specular_laser_retro"
 
 namespace rgl
 {
@@ -105,6 +110,35 @@ bool RGLServerPluginInstance::LoadConfiguration(const std::shared_ptr<const sdf:
         scanHMin = sdf->FindElement("pattern_lidar2d")->FindElement("horizontal")->Get<float>("min_angle");
         scanHMax = sdf->FindElement("pattern_lidar2d")->FindElement("horizontal")->Get<float>("max_angle");
         scanHSamples = lidarPatternSampleSize;
+    }
+
+    if (sdf->HasElement(PARAM_EXTENDED_OUTPUT_ID)) {
+        extendedOutput = sdf->Get<bool>(PARAM_EXTENDED_OUTPUT_ID);
+    }
+    if (sdf->HasElement(PARAM_SPECULAR_LASER_RETRO_ID)) {
+        specularReflections = true;
+        specularLaserRetro = sdf->Get<float>(PARAM_SPECULAR_LASER_RETRO_ID);
+    }
+
+    if (publishLaserScan && (extendedOutput || specularReflections)) {
+        gzwarn << "Parameters '" << PARAM_EXTENDED_OUTPUT_ID << "' and '" << PARAM_SPECULAR_LASER_RETRO_ID
+               << "' are not supported for LaserScan output (pattern_lidar2d). Ignoring them.\n";
+        extendedOutput = false;
+        specularReflections = false;
+    }
+
+    // Noise moves hit points away from the raytraced geometry, so mirror reflections would be computed from wrong points
+    if (specularReflections && (noiseAngularRay.enabled || noiseAngularHitpoint.enabled || noiseDistance.enabled)) {
+        gzerr << "Parameter '" << PARAM_SPECULAR_LASER_RETRO_ID << "' cannot be combined with '" << PARAM_NOISE_ID
+              << "'. Disabling plugin.\n";
+        return false;
+    }
+
+    if (extendedOutput) {
+        gzmsg << "RGL lidar extended output enabled (fields: ray_index, incident_angle, is_reflected)\n";
+    }
+    if (specularReflections) {
+        gzmsg << "RGL lidar mirror reflections enabled for visuals with laser_retro " << specularLaserRetro << "\n";
     }
 
     return true;
@@ -197,6 +231,12 @@ void RGLServerPluginInstance::CreateLidar(gz::sim::Entity entity,
         resultLaserScan.distances.resize(lidarPatternSampleSize);
         resultLaserScan.intensities.resize(lidarPatternSampleSize);
     }
+    const bool useExtendedPointCloud = extendedOutput || specularReflections;
+    if (useExtendedPointCloud)
+    {
+        resultExtendedPointCloud.points.resize(lidarPatternSampleSize);
+    }
+    const auto& pointCloudRglFields = useExtendedPointCloud ? resultExtendedPointCloud.rglFields : resultPointCloud.rglFields;
 
     for (std::size_t i = 0; i < lidarPattern.size(); i += lidarPatternSampleSize)
     {
@@ -214,8 +254,8 @@ void RGLServerPluginInstance::CreateLidar(gz::sim::Entity entity,
         !CheckRGL(rgl_node_raytrace(&rglNodeRaytrace, nullptr)) ||
         !CheckRGL(rgl_node_points_compact_by_field(&rglNodeCompact, RGL_FIELD_IS_HIT_I32)) ||
         !CheckRGL(rgl_node_points_yield(&rglNodeYieldLaserScan, resultLaserScan.rglFields.data(), resultLaserScan.rglFields.size())) ||
-        !CheckRGL(rgl_node_points_format(&rglNodeFormatPointCloudSensor, resultPointCloud.rglFields.data(), resultPointCloud.rglFields.size())) ||
-        !CheckRGL(rgl_node_points_format(&rglNodeFormatPointCloudWorld, resultPointCloud.rglFields.data(), resultPointCloud.rglFields.size())) ||
+        !CheckRGL(rgl_node_points_format(&rglNodeFormatPointCloudSensor, pointCloudRglFields.data(), pointCloudRglFields.size())) ||
+        !CheckRGL(rgl_node_points_format(&rglNodeFormatPointCloudWorld, pointCloudRglFields.data(), pointCloudRglFields.size())) ||
         !CheckRGL(rgl_node_points_transform(&rglNodeToLidarFrame, &identity))) {
 
         gzerr << "Failed to create RGL nodes when initializing lidar. Disabling plugin.\n";
@@ -263,6 +303,11 @@ void RGLServerPluginInstance::CreateLidar(gz::sim::Entity entity,
         return;
     }
 
+    if (specularReflections && !CreateMirrorGraph()) {
+        gzerr << "Failed to create RGL nodes for mirror reflections when initializing lidar. Disabling plugin.\n";
+        return;
+    }
+
     if (publishLaserScan) {
         if(!CheckRGL(rgl_graph_node_add_child(pointsTail, rglNodeYieldLaserScan)) ||
            // Optimization: rglNodeYieldLaserScan should be prioritized because it will be requested first
@@ -292,6 +337,7 @@ void RGLServerPluginInstance::UpdateLidarPose(const gz::sim::EntityComponentMana
     gz::math::Pose3<double> ignWorldToLidar = ignLidarToWorld.Inverse();
     rgl_mat3x4f rglLidarToWorld = IgnPose3dToRglMatrix(ignLidarToWorld);
     rgl_mat3x4f rglWorldToLidar = IgnPose3dToRglMatrix(ignWorldToLidar);
+    lidarToWorld = rglLidarToWorld;
     CheckRGL(rgl_node_rays_transform(&rglNodeLidarPose, &rglLidarToWorld));
     CheckRGL(rgl_node_points_transform(&rglNodeToLidarFrame, &rglWorldToLidar));
 }
@@ -361,6 +407,20 @@ void RGLServerPluginInstance::RayTrace(std::chrono::steady_clock::duration simTi
         }
         auto msg = CreateLaserScanMsg(simTime, frameId);
         laserScanPublisher.Publish(msg);
+    } else if (extendedOutput || specularReflections) {
+        if (!FetchExtendedPointCloudResult(rglNodeFormatPointCloudSensor)) {
+            gzerr << "Failed to fetch PointCloud result data (sensor frame) from RGL lidar.\n";
+            return;
+        }
+        if (specularReflections) {
+            if (!TraceMirrorReflections()) {
+                gzerr << "Failed to perform raytrace of mirror reflections.\n";
+                return;
+            }
+            ApplyMirrorReflections(false);
+        }
+        auto msg = CreateExtendedPointCloudMsg(simTime, frameId);
+        pointCloudPublisher.Publish(msg);
     } else {  // publish PointCloud
         if (!FetchPointCloudResult(rglNodeFormatPointCloudSensor)) {
             gzerr << "Failed to fetch PointCloud result data (sensor frame) from RGL lidar.\n";
@@ -370,7 +430,17 @@ void RGLServerPluginInstance::RayTrace(std::chrono::steady_clock::duration simTi
         pointCloudPublisher.Publish(msg);
     }
 
-    if (pointCloudWorldPublisher.HasConnections()) {
+    if (pointCloudWorldPublisher.HasConnections() && (extendedOutput || specularReflections)) {
+        if (!FetchExtendedPointCloudResult(rglNodeFormatPointCloudWorld)) {
+            gzerr << "Failed to fetch PointCloud result data (world frame) from RGL lidar.\n";
+            return;
+        }
+        if (specularReflections) {
+            ApplyMirrorReflections(true);
+        }
+        auto msg = CreateExtendedPointCloudMsg(simTime, worldFrameId);
+        pointCloudWorldPublisher.Publish(msg);
+    } else if (pointCloudWorldPublisher.HasConnections()) {
         if (!FetchPointCloudResult(rglNodeFormatPointCloudWorld)) {
             gzerr << "Failed to fetch PointCloud result data (world frame) from RGL lidar.\n";
             return;
@@ -400,6 +470,175 @@ bool RGLServerPluginInstance::FetchPointCloudResult(rgl_node_t formatNode)
         return false;
     }
     return true;
+}
+
+bool RGLServerPluginInstance::CreateMirrorGraph()
+{
+    mirrorTrace.hitPoints.resize(lidarPatternSampleSize);
+    mirrorTrace.distances.resize(lidarPatternSampleSize);
+    mirrorTrace.normals.resize(lidarPatternSampleSize);
+    mirrorTrace.rays.resize(lidarPatternSampleSize);
+    mirrorTrace.ranges.resize(lidarPatternSampleSize);
+    mirrorTrace.pointIdx.resize(lidarPatternSampleSize);
+    mirrorTrace.isHit.resize(lidarPatternSampleSize);
+    mirrorTrace.reflectedDistances.resize(lidarPatternSampleSize);
+    mirrorTrace.reflectedLaserRetro.resize(lidarPatternSampleSize);
+    mirrorTrace.reflectedIncidentAngles.resize(lidarPatternSampleSize);
+    mirrorTrace.reflections.reserve(lidarPatternSampleSize);
+
+    // Rays and ranges are replaced before every raytrace, a placeholder ray is used to create the nodes
+    rgl_mat3x4f identity = {
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0
+    };
+
+    return CheckRGL(rgl_node_points_yield(&rglNodeYieldMirror, mirrorTrace.rglFieldsPrimary.data(), mirrorTrace.rglFieldsPrimary.size())) &&
+           CheckRGL(rgl_graph_node_add_child(rglNodeCompact, rglNodeYieldMirror)) &&
+           CheckRGL(rgl_node_rays_from_mat3x4f(&rglNodeMirrorRays, &identity, 1)) &&
+           CheckRGL(rgl_node_rays_set_range(&rglNodeMirrorSetRange, &lidarMinMaxRange, 1)) &&
+           CheckRGL(rgl_node_raytrace(&rglNodeMirrorRaytrace, nullptr)) &&
+           CheckRGL(rgl_node_points_yield(&rglNodeMirrorYield, mirrorTrace.rglFieldsReflected.data(), mirrorTrace.rglFieldsReflected.size())) &&
+           CheckRGL(rgl_graph_node_add_child(rglNodeMirrorRays, rglNodeMirrorSetRange)) &&
+           CheckRGL(rgl_graph_node_add_child(rglNodeMirrorSetRange, rglNodeMirrorRaytrace)) &&
+           CheckRGL(rgl_graph_node_add_child(rglNodeMirrorRaytrace, rglNodeMirrorYield));
+}
+
+bool RGLServerPluginInstance::FetchExtendedPointCloudResult(rgl_node_t formatNode)
+{
+    int32_t rglPointSize = -1;
+    if (!CheckRGL(rgl_graph_get_result_size(formatNode, RGL_FIELD_DYNAMIC_FORMAT, &resultExtendedPointCloud.hitPointCount, &rglPointSize))) {
+        return false;
+    }
+    assert(rglPointSize == sizeof(ExtendedPoint));
+    if (!CheckRGL(rgl_graph_get_result_data(formatNode, RGL_FIELD_DYNAMIC_FORMAT, resultExtendedPointCloud.points.data()))) {
+        return false;
+    }
+
+    // RGL counts ray indices within the active pattern, alternating patterns are offset to index the whole pattern.
+    // The RGL padding field holds isReflected and the message padding.
+    const uint32_t rayIdxOffset = alternatingPatternIndex * lidarPatternSampleSize;
+    for (int32_t i = 0; i < resultExtendedPointCloud.hitPointCount; ++i) {
+        auto& point = resultExtendedPointCloud.points[i];
+        point.rayIdx += rayIdxOffset;
+        point.isReflected = 0;
+        std::fill(std::begin(point.padding), std::end(point.padding), 0);
+    }
+    return true;
+}
+
+bool RGLServerPluginInstance::TraceMirrorReflections()
+{
+    mirrorTrace.reflections.clear();
+
+    int32_t pointCount = -1;
+    if (!CheckRGL(rgl_graph_get_result_size(rglNodeYieldMirror, RGL_FIELD_XYZ_VEC3_F32, &pointCount, nullptr)) ||
+        !CheckRGL(rgl_graph_get_result_data(rglNodeYieldMirror, RGL_FIELD_XYZ_VEC3_F32, mirrorTrace.hitPoints.data())) ||
+        !CheckRGL(rgl_graph_get_result_data(rglNodeYieldMirror, RGL_FIELD_DISTANCE_F32, mirrorTrace.distances.data())) ||
+        !CheckRGL(rgl_graph_get_result_data(rglNodeYieldMirror, RGL_FIELD_NORMAL_VEC3_F32, mirrorTrace.normals.data()))) {
+        return false;
+    }
+    if (pointCount != resultExtendedPointCloud.hitPointCount) {
+        gzerr << "Mismatch between hit point counts of the point cloud (" << resultExtendedPointCloud.hitPointCount
+              << ") and the mirror input (" << pointCount << ").\n";
+        return false;
+    }
+
+    // Reflect rays hitting a mirror: d' = d - 2 (d.n) n, which does not depend on the orientation of n.
+    // The reflected ray starts slightly off the mirror and may travel the remaining range of the lidar.
+    const float maxRange = lidarMinMaxRange.value[1];
+    int32_t rayCount = 0;
+    for (int32_t i = 0; i < pointCount; ++i) {
+        const auto& point = resultExtendedPointCloud.points[i];
+        if (point.laserRetro != specularLaserRetro) {
+            continue;
+        }
+        const float range = maxRange - mirrorTrace.distances[i] - MirrorTrace::rayOriginOffset;
+        const gz::math::Vector3f normal(mirrorTrace.normals[i].value[0], mirrorTrace.normals[i].value[1], mirrorTrace.normals[i].value[2]);
+        if (range <= 0.0f || normal.SquaredLength() < 1e-12f) {
+            continue;
+        }
+        // Ray direction in world frame: rotation of the lidar pose applied to the z axis of the ray pose
+        const rgl_mat3x4f& ray = lidarPattern[point.rayIdx];
+        gz::math::Vector3f direction;
+        for (int row = 0; row < 3; ++row) {
+            direction[row] = lidarToWorld.value[row][0] * ray.value[0][2] +
+                             lidarToWorld.value[row][1] * ray.value[1][2] +
+                             lidarToWorld.value[row][2] * ray.value[2][2];
+        }
+        direction.Normalize();
+        const gz::math::Vector3f unitNormal = normal.Normalized();
+        const gz::math::Vector3f reflected = (direction - 2.0f * direction.Dot(unitNormal) * unitNormal).Normalized();
+        const gz::math::Vector3f origin = gz::math::Vector3f(mirrorTrace.hitPoints[i].value[0],
+                                                             mirrorTrace.hitPoints[i].value[1],
+                                                             mirrorTrace.hitPoints[i].value[2]) +
+                                          reflected * MirrorTrace::rayOriginOffset;
+
+        // RGL rays point along the z axis of their pose, x and y complete a right-handed orthonormal basis
+        const gz::math::Vector3f helper = std::abs(reflected.X()) < 0.9f ? gz::math::Vector3f::UnitX : gz::math::Vector3f::UnitY;
+        const gz::math::Vector3f xAxis = helper.Cross(reflected).Normalized();
+        const gz::math::Vector3f yAxis = reflected.Cross(xAxis);
+        rgl_mat3x4f& rayPose = mirrorTrace.rays[rayCount];
+        for (int row = 0; row < 3; ++row) {
+            rayPose.value[row][0] = xAxis[row];
+            rayPose.value[row][1] = yAxis[row];
+            rayPose.value[row][2] = reflected[row];
+            rayPose.value[row][3] = origin[row];
+        }
+        mirrorTrace.ranges[rayCount] = {0.0f, range};
+        mirrorTrace.pointIdx[rayCount] = i;
+        ++rayCount;
+    }
+
+    if (rayCount == 0) {
+        return true;
+    }
+
+    if (!CheckRGL(rgl_node_rays_from_mat3x4f(&rglNodeMirrorRays, mirrorTrace.rays.data(), rayCount)) ||
+        !CheckRGL(rgl_node_rays_set_range(&rglNodeMirrorSetRange, mirrorTrace.ranges.data(), rayCount)) ||
+        !CheckRGL(rgl_graph_run(rglNodeMirrorRaytrace)) ||
+        !CheckRGL(rgl_graph_get_result_data(rglNodeMirrorYield, RGL_FIELD_IS_HIT_I32, mirrorTrace.isHit.data())) ||
+        !CheckRGL(rgl_graph_get_result_data(rglNodeMirrorYield, RGL_FIELD_DISTANCE_F32, mirrorTrace.reflectedDistances.data())) ||
+        !CheckRGL(rgl_graph_get_result_data(rglNodeMirrorYield, RGL_FIELD_LASER_RETRO_F32, mirrorTrace.reflectedLaserRetro.data())) ||
+        !CheckRGL(rgl_graph_get_result_data(rglNodeMirrorYield, RGL_FIELD_INCIDENT_ANGLE_F32, mirrorTrace.reflectedIncidentAngles.data()))) {
+        return false;
+    }
+
+    // Reflected rays hitting nothing or another mirror leave the point on the mirror surface
+    for (int32_t j = 0; j < rayCount; ++j) {
+        if (!mirrorTrace.isHit[j] || mirrorTrace.reflectedLaserRetro[j] == specularLaserRetro) {
+            continue;
+        }
+        const std::size_t i = mirrorTrace.pointIdx[j];
+        const float pathLength = mirrorTrace.distances[i] + MirrorTrace::rayOriginOffset + mirrorTrace.reflectedDistances[j];
+        mirrorTrace.reflections.push_back({i, pathLength / mirrorTrace.distances[i],
+                                           mirrorTrace.reflectedLaserRetro[j], mirrorTrace.reflectedIncidentAngles[j]});
+    }
+    return true;
+}
+
+void RGLServerPluginInstance::ApplyMirrorReflections(bool worldFrame)
+{
+    // A time-of-flight sensor sees the reflected surface along the original ray at the total path length
+    for (const auto& reflection : mirrorTrace.reflections) {
+        auto& point = resultExtendedPointCloud.points[reflection.pointIdx];
+        const rgl_mat3x4f& ray = lidarPattern[point.rayIdx];
+        gz::math::Vector3f origin(ray.value[0][3], ray.value[1][3], ray.value[2][3]);
+        if (worldFrame) {
+            gz::math::Vector3f originWorld;
+            for (int row = 0; row < 3; ++row) {
+                originWorld[row] = lidarToWorld.value[row][0] * origin[0] + lidarToWorld.value[row][1] * origin[1] +
+                                   lidarToWorld.value[row][2] * origin[2] + lidarToWorld.value[row][3];
+            }
+            origin = originWorld;
+        }
+        for (int axis = 0; axis < 3; ++axis) {
+            point.xyz.value[axis] = origin[axis] + (point.xyz.value[axis] - origin[axis]) * reflection.distanceScale;
+        }
+        point.laserRetro = reflection.laserRetro;
+        point.incidentAngle = reflection.incidentAngle;
+        point.isReflected = 1;
+    }
 }
 
 gz::msgs::LaserScan RGLServerPluginInstance::CreateLaserScanMsg(std::chrono::steady_clock::duration simTime, const std::string& frame)
@@ -449,6 +688,42 @@ gz::msgs::PointCloudPacked RGLServerPluginInstance::CreatePointCloudMsg(std::chr
     return outMsg;
 }
 
+gz::msgs::PointCloudPacked RGLServerPluginInstance::CreateExtendedPointCloudMsg(std::chrono::steady_clock::duration simTime, const std::string& frame)
+{
+    const auto pointCount = resultExtendedPointCloud.hitPointCount;
+    gz::msgs::PointCloudPacked outMsg;
+    if (extendedOutput) {
+        gz::msgs::InitPointCloudPacked(outMsg, frame, false,
+                                       {{"xyz", gz::msgs::PointCloudPacked::Field::FLOAT32},
+                                        {"intensity", gz::msgs::PointCloudPacked::Field::FLOAT32},
+                                        {"ray_index", gz::msgs::PointCloudPacked::Field::UINT32},
+                                        {"incident_angle", gz::msgs::PointCloudPacked::Field::FLOAT32},
+                                        {"is_reflected", gz::msgs::PointCloudPacked::Field::UINT8}});
+        // Pad points to keep the 4 byte alignment of the fields
+        outMsg.set_point_step(sizeof(ExtendedPoint));
+    } else {
+        gz::msgs::InitPointCloudPacked(outMsg, frame, false,
+                                       {{"xyz", gz::msgs::PointCloudPacked::Field::FLOAT32},
+                                        {"intensity", gz::msgs::PointCloudPacked::Field::FLOAT32}});
+    }
+    outMsg.mutable_data()->resize(pointCount * outMsg.point_step());
+    *outMsg.mutable_header()->mutable_stamp() = gz::msgs::Convert(simTime);
+    outMsg.set_height(1);
+    outMsg.set_width(pointCount);
+    outMsg.set_row_step(pointCount * outMsg.point_step());
+
+    char* data = outMsg.mutable_data()->data();
+    if (extendedOutput) {
+        memcpy(data, resultExtendedPointCloud.points.data(), pointCount * sizeof(ExtendedPoint));
+    } else {
+        // xyz and laserRetro lead ExtendedPoint in the layout of the basic point cloud
+        for (int32_t i = 0; i < pointCount; ++i) {
+            memcpy(data + i * outMsg.point_step(), &resultExtendedPointCloud.points[i], resultPointCloud.pointSize);
+        }
+    }
+    return outMsg;
+}
+
 void RGLServerPluginInstance::DestroyLidar()
 {
     if (!isLidarInitialized) {
@@ -457,6 +732,9 @@ void RGLServerPluginInstance::DestroyLidar()
 
     if (!CheckRGL(rgl_graph_destroy(rglNodeRaytrace))) {
         gzerr << "Failed to destroy RGL lidar.\n";
+    }
+    if (specularReflections && !CheckRGL(rgl_graph_destroy(rglNodeMirrorRaytrace))) {
+        gzerr << "Failed to destroy RGL graph of mirror reflections.\n";
     }
     // Reset publishers
     if (!publishLaserScan) {

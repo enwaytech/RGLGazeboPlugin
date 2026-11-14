@@ -1,0 +1,93 @@
+<?xml version="1.0"?>
+<!--
+  Minimal world for the extended point cloud output and mirror reflections.
+  The mirror (laser_retro -1) is turned by 45 degrees and reflects rays coming from the lidar towards the wall
+  (laser_retro 50). Reflected points appear behind the mirror, at the mirror image of the wall and the ground.
+  Rays reflected upwards miss the wall and stay on the mirror surface.
+-->
+<sdf version='1.9'>
+  <world name='rgl_mirror'>
+
+    <plugin name='rgl::RGLServerPluginManager' filename='RGLServerPluginManager'>
+      <do_ignore_entities_in_lidar_link>true</do_ignore_entities_in_lidar_link>
+    </plugin>
+
+    <model name='ground_plane'>
+      <static>true</static>
+      <link name='link'>
+        <visual name='visual'>
+          <laser_retro>10</laser_retro>
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>100 100</size>
+            </plane>
+          </geometry>
+        </visual>
+      </link>
+    </model>
+
+    <model name='mirror'>
+      <static>true</static>
+      <pose>3 0 1.25 0 0 0.785398</pose>
+      <link name='link'>
+        <visual name='visual'>
+          <laser_retro>-1</laser_retro>
+          <geometry>
+            <box>
+              <size>0.02 3 2.5</size>
+            </box>
+          </geometry>
+        </visual>
+      </link>
+    </model>
+
+    <model name='wall'>
+      <static>true</static>
+      <pose>3 -5 0.75 0 0 0</pose>
+      <link name='link'>
+        <visual name='visual'>
+          <laser_retro>50</laser_retro>
+          <geometry>
+            <box>
+              <size>8 0.2 1.5</size>
+            </box>
+          </geometry>
+        </visual>
+      </link>
+    </model>
+
+    <model name='lidar'>
+      <static>true</static>
+      <pose>0 0 1 0 0 0.3</pose>
+      <link name='link'>
+        <sensor name='rgl_lidar' type='custom'>
+          <plugin filename='RGLServerPluginInstance' name='rgl::RGLServerPluginInstance'>
+            <range>
+              <min>0.1</min>
+              <max>30</max>
+            </range>
+            <update_rate>10</update_rate>
+            <topic>rgl_mirror</topic>
+            <frame>lidar</frame>
+            <extended_output>true</extended_output>
+            <specular_laser_retro>-1.0</specular_laser_retro>
+            <pattern_uniform>
+              <horizontal>
+                <samples>900</samples>
+                <min_angle>-3.14159</min_angle>
+                <max_angle>3.14159</max_angle>
+              </horizontal>
+              <vertical>
+                <samples>96</samples>
+                <min_angle>-0.6</min_angle>
+                <max_angle>0.4</max_angle>
+              </vertical>
+            </pattern_uniform>
+          </plugin>
+        </sensor>
+      </link>
+    </model>
+
+  </world>
+</sdf>
